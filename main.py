@@ -3797,9 +3797,55 @@ class HumanCorePlugin(Star):
     async def stop(self):
         await self.terminate()
 
+    # ---- 补丁：同一人的多平台账号合并（开关 uid_merge_enabled） ----
+    def _canonical_uid(self, event):
+        """把平台账号换算成同一个人的主 uid；关掉开关就返回原 uid。"""
+        try:
+            uid = str(event.get_sender_id())
+        except Exception:
+            return ""
+        if not self.cfg_bool("uid_merge_enabled", True):
+            return uid
+        # 配置/文件变了就重建映射，免得改完还要重启
+        cache_key = None
+        try:
+            text = str(self.cfg_str("uid_alias_map", "") or "").strip()
+            map_path = os.path.join(os.path.dirname(str(self.db.path)), "uid_map.json")
+            stamp = os.path.getmtime(map_path) if os.path.exists(map_path) else 0
+            cache_key = (text, stamp)
+        except Exception:
+            cache_key = None
+        if getattr(self, "_uid_alias_cache_key", None) != cache_key:
+            self._uid_alias_map = None
+            self._uid_alias_cache_key = cache_key
+        mapping = getattr(self, "_uid_alias_map", None)
+        if mapping is None:
+            mapping = {}
+            raw = {}
+            try:
+                text = str(self.cfg_str("uid_alias_map", "") or "").strip()
+                parsed = json.loads(text) if text else {}
+                if isinstance(parsed, dict):
+                    raw.update(parsed)
+            except Exception as exc:
+                logger.warning("[amo] uid_alias_map 配置解析失败: %s" % exc)
+            try:
+                map_path = os.path.join(os.path.dirname(str(self.db.path)), "uid_map.json")
+                if os.path.exists(map_path):
+                    with open(map_path, "r", encoding="utf-8") as fh:
+                        parsed = json.load(fh)
+                    if isinstance(parsed, dict):
+                        for key, value in parsed.items():
+                            raw.setdefault(key, value)
+            except Exception as exc:
+                logger.warning("[amo] uid_map 读取失败: %s" % exc)
+            mapping = {str(k): str(v) for k, v in raw.items() if k and v}
+            self._uid_alias_map = mapping
+        return mapping.get(uid, uid)
+
     # ---------- 管理员 ----------
     def _is_admin(self, event):
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         if uid in self.admin_uids:
             return True
         try:
@@ -3815,7 +3861,7 @@ class HumanCorePlugin(Star):
 
     # ---------- 消息学习 ----------
     async def _learn(self, event, text):
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         name = event.get_sender_name() or uid
         umo = event.unified_msg_origin
         group_id = event.get_group_id()
@@ -3823,6 +3869,8 @@ class HumanCorePlugin(Star):
         profile = self.db.touch_profile(
             uid, name, event.get_platform_name(), umo, group_id, private
         )
+        if private and umo:
+            self._record_channel(uid, umo, event.get_platform_name())
         if profile and not profile.get("is_admin") and uid in self.admin_uids:
             self.db.update_profile(uid, is_admin=1)
             profile["is_admin"] = 1
@@ -3927,7 +3975,7 @@ class HumanCorePlugin(Star):
         group_id = str(event.get_group_id() or "")
         if not group_id:
             return False
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         lovers = self._lover_aliases()
         if not lovers or uid in set(lovers.values()) or self._is_registered_lover(uid):
             return False
@@ -4949,7 +4997,7 @@ class HumanCorePlugin(Star):
             self.state.apply_schedule_events()
         except Exception:
             pass
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         if not uid or uid == str(event.get_self_id()):
             return
         text = (event.message_str or "").strip()
@@ -4997,7 +5045,7 @@ class HumanCorePlugin(Star):
     async def _handle_private(self, event, profile):
         snap = self.state.snapshot()
         umo = event.unified_msg_origin
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         if self._recent_bot_initiated(umo):
             self._disturb_until[str(umo)] = 0
             logger.info("[amo] 主动消息后的回复，按正常聊天处理")
@@ -5083,7 +5131,7 @@ class HumanCorePlugin(Star):
             logger.debug("[amo] 群聊插话判定: %s" % json.dumps(result, ensure_ascii=False))
         if not result["reply"]:
             return
-        memories, memory_text = self._recall(str(event.get_sender_id()), text)
+        memories, memory_text = self._recall(self._canonical_uid(event), text)
         reply = await self._compose_reply(event, text, snap, profile, memories, memory_text, True)
         if not reply:
             return
@@ -5136,7 +5184,7 @@ class HumanCorePlugin(Star):
 
     async def _compose_reply(self, event, text, snap, profile, memories, memory_text, group):
         umo = event.unified_msg_origin
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         name = profile.get("alias") or profile.get("name") or event.get_sender_name() or "对方"
         relation = profile.get("relation", "普通")
         persona = await self.llm.persona(umo)
@@ -5147,7 +5195,7 @@ class HumanCorePlugin(Star):
         consult = bool(re.search(r"(怎么|如何|为什么|步骤|怎么办|该怎么做|教程|方法|建议|教我|能不能|是什么|该不该|可不可以)", text or ""))
         recent = self._recent(umo, 10)
         lines = []
-        current_uid = str(event.get_sender_id())
+        current_uid = self._canonical_uid(event)
         current_place = str((snap.get("activity") or {}).get("place") or "")
         for item in recent:
             content = str(item.get("content") or "")
@@ -5501,7 +5549,7 @@ class HumanCorePlugin(Star):
 
     async def _dynamic_context(self, event):
         await self._sync_persona_name(event)
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         profile = self.db.get_profile(uid)
         relation = profile.get("relation", "普通")
         snap = self.state.snapshot()
@@ -5672,7 +5720,7 @@ class HumanCorePlugin(Star):
             quote_id = getattr(event.message_obj, "message_id", None) if quote_enabled else None
             if self.cfg_bool("polish_native", False):
                 snap = self.state.snapshot()
-                native_profile = self.db.get_profile(str(event.get_sender_id())) or {}
+                native_profile = self.db.get_profile(self._canonical_uid(event)) or {}
                 native_relation = str(native_profile.get("relation") or "普通")
                 native_name = str(native_profile.get("alias") or native_profile.get("name") or "对方")
                 native_tone = self._tone_with_continuity(
@@ -6048,6 +6096,51 @@ class HumanCorePlugin(Star):
             return "share"
         return "greet"
 
+    # ---- 补丁：主动消息多平台轮换（开关 proactive_rotate_enabled） ----
+    def _record_channel(self, uid, umo, platform):
+        """记下这个人各平台的会话地址，供主动消息选边。"""
+        if not uid or not umo:
+            return
+        try:
+            key = "channels:%s" % uid
+            data = self.db.kv_get(key, {}) or {}
+            if not isinstance(data, dict):
+                data = {}
+            data[str(platform or "?")] = {"umo": str(umo), "ts": now_ts()}
+            self.db.kv_set(key, data)
+        except Exception as exc:
+            logger.debug("[amo] 记录通道失败: %s" % exc)
+
+    def _pick_proactive_umo(self, profile):
+        """选这轮主动消息发哪个平台；关掉开关就用 private_umo。"""
+        fallback = str(profile.get("private_umo") or "")
+        if not self.cfg_bool("proactive_rotate_enabled", True):
+            return fallback
+        uid = str(profile.get("uid") or "")
+        try:
+            data = self.db.kv_get("channels:%s" % uid, {}) or {}
+        except Exception:
+            return fallback
+        if not isinstance(data, dict):
+            return fallback
+        items = []
+        for value in data.values():
+            if isinstance(value, dict) and value.get("umo"):
+                items.append((float(value.get("ts") or 0), str(value.get("umo"))))
+        if not items:
+            return fallback
+        items.sort(key=lambda pair: -pair[0])
+        if len(items) == 1:
+            return items[0][1]
+        window = max(1, self.cfg_int("proactive_recent_minutes", 30)) * 60
+        if now_ts() - items[0][0] <= window:
+            return items[0][1]
+        last = str(self.db.kv_get("last_channel:%s" % uid, "") or "")
+        for _, umo in items:
+            if umo != last:
+                return umo
+        return items[0][1]
+
     async def _maybe_proactive(self):
         quiet = quiet_now(self.cfg_str("quiet_hours", "23:30-07:30"))
         try:
@@ -6063,9 +6156,10 @@ class HumanCorePlugin(Star):
         interval = max(10, self.cfg_int("proactive_interval_min", 90)) * 60
         daily_max = max(0, self.cfg_int("proactive_daily_max", 3))
         for profile in profiles:
-            if not profile.get("private_umo"):
+            target_umo = self._pick_proactive_umo(profile)
+            if not target_umo:
                 continue
-            if self._recent_bot_initiated(profile["private_umo"], 3600):
+            if self._recent_bot_initiated(target_umo, 3600):
                 continue
             count = to_int(profile.get("proactive_count"))
             if profile.get("proactive_day") != today_str():
@@ -6103,19 +6197,20 @@ class HumanCorePlugin(Star):
                 continue
             kind = self._choose_proactive_kind(profile, snap, category)
             text = await self.llm.gen_proactive(
-                profile["private_umo"], profile, snap, kind
+                target_umo, profile, snap, kind
             )
             if not text:
                 continue
-            ok = await self._send_to_umo(profile["private_umo"], text)
+            ok = await self._send_to_umo(target_umo, text)
             if ok:
-                self._mark_bot_initiated(profile["private_umo"])
+                self._mark_bot_initiated(target_umo)
+                self.db.kv_set("last_channel:%s" % profile.get("uid"), target_umo)
                 self.db.bump_proactive(profile["uid"])
                 self.db.log_proactive(profile["uid"], kind, text)
                 self._set_proactive_pending(profile["uid"], kind, text)
                 self._last_proactive_activity[str(profile.get("uid"))] = today_str() + ":" + str(datetime.now().hour)
                 self.db.add_message(
-                    profile["private_umo"], str(self.context.get_config().get("bot_id", "bot")),
+                    target_umo, str(self.context.get_config().get("bot_id", "bot")),
                     self.bot_name, "bot", text,
                 )
                 logger.debug("[amo] 主动私聊 -> %s (%s)" % (profile.get("name", ""), kind))
@@ -6139,10 +6234,10 @@ class HumanCorePlugin(Star):
         if index < len(args):
             token = str(args[index]).strip().lstrip("@")
             if token in ("我", "me", "self"):
-                return str(event.get_sender_id())
+                return self._canonical_uid(event)
             if token:
                 return token
-        return str(event.get_sender_id())
+        return self._canonical_uid(event)
 
     async def _status_data(self):
         self._reload_config_if_changed()
@@ -6227,7 +6322,7 @@ class HumanCorePlugin(Star):
     async def _handle_command(self, event):
         args = self._args(event)
         sub = args[0].lower() if args else "help"
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
 
         if sub in ("help", "帮助", ""):
             return (
@@ -6563,7 +6658,7 @@ class HumanCorePlugin(Star):
     @filter.command("c_profile")
     async def cmd_profile(self, event: AstrMessageEvent):
         await self._ensure_ready()
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         profile = self.db.get_profile(uid)
         if not profile:
             yield event.plain_result("还没有你的档案。")
@@ -6584,7 +6679,7 @@ class HumanCorePlugin(Star):
         if relation not in RELATIONS:
             yield event.plain_result("用法：/c_setrel 仇恨|抵触|普通|熟识|相恋")
             return
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         self.db.update_profile(uid, relation=relation)
         yield event.plain_result("✅ 关系已设置为：" + relation)
 
@@ -6598,7 +6693,7 @@ class HumanCorePlugin(Star):
         if not text:
             yield event.plain_result("请输入要学习的内容")
             return
-        uid = str(event.get_sender_id())
+        uid = self._canonical_uid(event)
         self.db.add_memory(
             uid, text, "manual", 1,
             self.cfg_int("mem_days_normal", 7),

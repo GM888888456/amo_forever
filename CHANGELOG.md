@@ -1,5 +1,15 @@
 # Changelog
 
+## 未发布
+
+- 新增**跨平台账号合并**：`uid_merge_enabled`（默认开）+ `uid_alias_map`；
+  开启后其它平台账号按映射并到主 uid，档案、好感、关系网、称呼共用一份，
+  同一个人在 QQ / 飞书 不再各建一份档案；映射也可写在数据目录的 `uid_map.json`。
+- 新增**主动消息跨平台轮换**：`proactive_rotate_enabled`（默认开）+ `proactive_recent_minutes`（默认 30）；
+  最近 N 分钟在哪个平台说过话就把主动消息发哪边，都冷了就两边轮流，避开上一轮发过的那边。
+- 两个开关都关掉时，行为与之前完全一致；只读 `uid_map.json`、只写 `kv`，不动表结构，不影响已有数据。
+- 映射缓存按「配置内容 + uid_map.json 修改时间」失效，改开关或改映射不需要重启。
+
 ## 4.2.2
 
 - 修复 Memory Companion 画像名字显示为 `person_xxx` 哈希的问题：优先读 `identities` 的真实 `display_name`；
